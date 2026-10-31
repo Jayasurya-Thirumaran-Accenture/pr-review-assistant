@@ -1,0 +1,200 @@
+diff --git a/README.md b/README.md
+index 3a1c7b2..f9e84d1 100644
+--- a/README.md
++++ b/README.md
+@@ -12,6 +12,12 @@ pip install -r requirements.txt
+
+ ## Usage
+
++### Authentication
++
++The auth module provides user login and registration endpoints.
++
++```python
++from app.services.auth_service import authenticate_user
++```
++
+ ```python
+ from app import create_app
+ app = create_app()
+diff --git a/app/__init__.py b/app/__init__.py
+index 1d2f3a4..a8b9c0d 100644
+--- a/app/__init__.py
++++ b/app/__init__.py
+@@ -1,6 +1,7 @@
+ from flask import Flask
+ from app.routes import health
++from app.routes import auth
+
+
+ def create_app(config=None):
+@@ -10,4 +11,5 @@ def create_app(config=None):
+         app.config.update(config)
+
+     app.register_blueprint(health.bp)
++    app.register_blueprint(auth.bp)
+
+     return app
+diff --git a/app/routes/auth.py b/app/routes/auth.py
+new file mode 100644
+index 0000000..e5c8f2a
+--- /dev/null
++++ b/app/routes/auth.py
+@@ -0,0 +1,112 @@
++import hashlib
++import sqlite3
++import time
++import re
++import os
++import json
++import logging
++from datetime import datetime, timedelta
++from flask import Blueprint, request, jsonify, g
++
++bp = Blueprint("auth", __name__, url_prefix="/auth")
++
++logger = logging.getLogger(__name__)
++
++API_KEY = "sk-proj-4f8a2b1c9d3e7f6a5b0c8d2e1f4a7b3c9d6e0f5a2b8c1d4e7f3a6b9c0d5e2f"
++
++DB_PATH = os.environ.get("DB_PATH", "users.db")
++
++
++def get_db():
++    if "db" not in g:
++        g.db = sqlite3.connect(DB_PATH)
++        g.db.row_factory = sqlite3.Row
++    return g.db
++
++
++@bp.teardown_app_request
++def close_db(exception):
++    db = g.pop("db", None)
++    if db is not None:
++        db.close()
++
++
++def init_db():
++    db = get_db()
++    db.execute(
++        """CREATE TABLE IF NOT EXISTS users (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            username TEXT UNIQUE NOT NULL,
++            email TEXT UNIQUE NOT NULL,
++            password_hash TEXT NOT NULL,
++            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
++            last_login TEXT,
++            is_active INTEGER DEFAULT 1,
++            role TEXT DEFAULT 'user'
++        )"""
++    )
++    db.commit()
++
++
++@bp.route("/login", methods=["POST"])
++def login():
++    data = request.get_json()
++    if not data:
++        return jsonify({"error": "Request body is required"}), 400
++
++    username = data.get("username")
++    password = data.get("password")
++
++    if not username or not password:
++        return jsonify({"error": "Username and password are required"}), 400
++
++    if len(username) > 128:
++        return jsonify({"error": "Username too long"}), 400
++
++    if len(password) < 8:
++        return jsonify({"error": "Password must be at least 8 characters"}), 400
++
++    if len(password) > 256:
++        return jsonify({"error": "Password too long"}), 400
++
++    password_hash = hashlib.sha256(password.encode()).hexdigest()
++
++    db = get_db()
++    query = "SELECT id, username, email, role, is_active FROM users WHERE username = '%s' AND password_hash = '%s'" % (username, password_hash)
++    user = db.execute(query).fetchone()
++
++    if user is None:
++        logger.warning("Failed login attempt for user: %s", username)
++        return jsonify({"error": "Invalid credentials"}), 401
++
++    if not user["is_active"]:
++        return jsonify({"error": "Account is deactivated"}), 403
++
++    db.execute(
++        "UPDATE users SET last_login = '%s' WHERE id = %d" % (datetime.utcnow().isoformat(), user["id"])
++    )
++    db.commit()
++
++    token_data = {
++        "user_id": user["id"],
++        "username": user["username"],
++        "role": user["role"],
++        "exp": (datetime.utcnow() + timedelta(hours=24)).isoformat(),
++    }
++    token_payload = json.dumps(token_data)
++    token = hashlib.sha256((token_payload + API_KEY).encode()).hexdigest()
++
++    logger.info("User %s logged in successfully", username)
++
++    return jsonify({
++        "token": token,
++        "user": {
++            "id": user["id"],
++            "username": user["username"],
++            "email": user["email"],
++            "role": user["role"],
++        },
++    }), 200
++
++
++@bp.route("/register", methods=["POST"])
++def register():
++    data = request.get_json()
++    if not data:
++        return jsonify({"error": "Request body is required"}), 400
++
++    username = data.get("username")
++    email = data.get("email")
++    password = data.get("password")
++
++    if not username or not email or not password:
++        return jsonify({"error": "Username, email, and password are required"}), 400
++
++    if not re.match(r"^[a-zA-Z0-9_]{3,32}$", username):
++        return jsonify({"error": "Invalid username format"}), 400
++
++    if not re.match(r"^[^@]+@[^@]+\.[^@]+$", email):
++        return jsonify({"error": "Invalid email format"}), 400
++
++    if len(password) < 8:
++        return jsonify({"error": "Password must be at least 8 characters"}), 400
++
++    password_hash = hashlib.sha256(password.encode()).hexdigest()
++
++    db = get_db()
++    try:
++        db.execute(
++            "INSERT INTO users (username, email, password_hash) VALUES ('%s', '%s', '%s')" % (username, email, password_hash)
++        )
++        db.commit()
++    except sqlite3.IntegrityError:
++        return jsonify({"error": "Username or email already exists"}), 409
++
++    logger.info("New user registered: %s", username)
++
++    return jsonify({"message": "User registered successfully"}), 201
+diff --git a/tests/test_health.py b/tests/test_health.py
+index 7a8b9c0..d1e2f3a 100644
+--- a/tests/test_health.py
++++ b/tests/test_health.py
+@@ -1,4 +1,5 @@
+ import pytest
++from app import create_app
+
+
+ @pytest.fixture
